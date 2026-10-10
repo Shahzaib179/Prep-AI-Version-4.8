@@ -228,6 +228,60 @@ def _m010_tutor_documents(con: Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS ix_tchunk_tutor ON tutor_doc_chunks(tutor_id)")
 
 
+def _m011_repair_tutor_documents(con: Connection) -> None:
+    """Self-heal databases where ``tutor_documents`` / ``tutor_doc_chunks`` already existed with a different layout.
+
+    Migration 10 uses ``CREATE TABLE IF NOT EXISTS``, so a table left over from an earlier build (e.g. on Supabase) keeps its
+    old columns and ``SELECT ... pages, characters ...`` fails with ``UndefinedColumn``. Here every required column is
+    checked: harmless gaps are filled with ``ALTER TABLE ADD COLUMN``; a structurally different table is renamed to
+    ``<table>_legacy_<timestamp>`` (nothing is deleted) and recreated. Documents can simply be re-uploaded.
+    """
+    t = _types(con)
+    docs_ddl = (f"CREATE TABLE IF NOT EXISTS tutor_documents (id {t['PK']}, tutor_id TEXT NOT NULL, title TEXT, subject TEXT, filename TEXT, sha256 TEXT NOT NULL, "
+                "pages INTEGER, characters INTEGER, chunk_count INTEGER, created_at TEXT, UNIQUE(tutor_id, sha256))")
+    chunks_ddl = (f"CREATE TABLE IF NOT EXISTS tutor_doc_chunks (id {t['PK']}, doc_id INTEGER NOT NULL, tutor_id TEXT NOT NULL, chunk_id INTEGER NOT NULL, filename TEXT, "
+                  f"page INTEGER, text TEXT NOT NULL, tokens TEXT, dim INTEGER NOT NULL, embedding {t['BLOB']} NOT NULL)")
+    docs_cols = {"id": "", "tutor_id": "TEXT", "title": "TEXT", "subject": "TEXT", "filename": "TEXT", "sha256": "TEXT",
+                 "pages": "INTEGER", "characters": "INTEGER", "chunk_count": "INTEGER", "created_at": "TEXT"}
+    chunk_cols = {"id": "", "doc_id": "INTEGER", "tutor_id": "TEXT", "chunk_id": "INTEGER", "filename": "TEXT", "page": "INTEGER",
+                  "text": "TEXT", "tokens": "TEXT", "dim": "INTEGER", "embedding": t["BLOB"]}
+    # columns that cannot be bolted on later (key / NOT NULL columns): if one of these is missing the table is rebuilt
+    structural = {"id", "tutor_id", "sha256", "doc_id", "chunk_id", "text", "dim", "embedding"}
+
+    def inspect(table: str, want: dict[str, str]) -> str:
+        have = con.columns(table)
+        if not have:
+            return "create"
+        missing = set(want) - have
+        if not missing:
+            return "ok"
+        return "rebuild" if missing & structural else "add"
+
+    plan_docs, plan_chunks = inspect("tutor_documents", docs_cols), inspect("tutor_doc_chunks", chunk_cols)
+    if plan_docs == "rebuild":
+        plan_chunks = "rebuild" if con.columns("tutor_doc_chunks") else "create"   # chunks point at document ids, so they go together
+    stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    for table, plan in (("tutor_documents", plan_docs), ("tutor_doc_chunks", plan_chunks)):
+        if plan == "rebuild":
+            con.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy_{stamp}")
+    for idx in ("ix_tdoc_tutor", "ix_tchunk_doc", "ix_tchunk_tutor"):
+        if "rebuild" in (plan_docs, plan_chunks):
+            con.execute(f"DROP INDEX IF EXISTS {idx}")
+    if plan_docs in ("create", "rebuild"):
+        con.execute(docs_ddl)
+    elif plan_docs == "add":
+        for col, typ in docs_cols.items():
+            con.add_column("tutor_documents", col, typ)
+    if plan_chunks in ("create", "rebuild"):
+        con.execute(chunks_ddl)
+    elif plan_chunks == "add":
+        for col, typ in chunk_cols.items():
+            con.add_column("tutor_doc_chunks", col, typ)
+    con.execute("CREATE INDEX IF NOT EXISTS ix_tdoc_tutor ON tutor_documents(tutor_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_tchunk_doc ON tutor_doc_chunks(doc_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_tchunk_tutor ON tutor_doc_chunks(tutor_id)")
+
+
 MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
     (1, "baseline schema", _m001_baseline),
     (2, "app_meta + memory_vectors", _m002_meta_and_vectors),
@@ -239,6 +293,7 @@ MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
     (8, "daily challenge, live quizzes, reminders, AI eval runs", _m008_month2),
     (9, "PDF assignments, stored files, submissions", _m009_pdf_assignments),
     (10, "tutor document library (chunks, keywords, embeddings)", _m010_tutor_documents),
+    (11, "repair tutor document tables from older layouts", _m011_repair_tutor_documents),
 ]
 
 
